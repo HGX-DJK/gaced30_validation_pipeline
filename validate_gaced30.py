@@ -880,10 +880,20 @@ def main():
                         except Exception as e:
                             pass
 
-                # 若仍无参考数据，自动按 Cochran 公式进行分层抽样模拟
+                # 若仍无参考数据：如果用户明确放入了参考数据但空间不重叠，严正报错中止；只有参考库彻底为空时才允许仿真演示
                 if len(matched_ref) < 20:
-                    print(f"  -> 瓦片 [{tile_name}] 未在参考库中匹配到足够重叠真值，自动依据 Cochran 规程布设基准抽样样方...")
-                    _, matched_ref = simulate_benchmark_scene(rows=mask.shape[0], cols=mask.shape[1], seed=42)
+                    if ref_files:
+                        print(f"\n❌ 【验证中止：空间范围完全不相交 (Spatial Non-Overlapping Error)】")
+                        print(f"   • 您在 data/reference_data/ 中放入了参考数据，但其空间经纬度与源数据 [{tile_name}] 完全错开，交集面积为 0！")
+                        print(f"   • 遥感真实性检验铁律：混淆矩阵与精度评估必须建立在【相同地理空间范围】的同名像元之上。")
+                        print(f"   • 系统拒绝在没有空间重叠的数据间强行计算或伪造虚假高精度。")
+                        print(f"   👉 解决方案：")
+                        print(f"      1. 请下载并放入覆盖本瓦片空间范围 ({bounds[0]:.1f}~{bounds[2]:.1f}°E, {bounds[1]:.1f}~{bounds[3]:.1f}°N) 的参考图层或地面实测 CSV；")
+                        print(f"      2. 若仅想快速体验系统全流程报告生成，可执行: python main.py --demo 启动仿真测试套件。\n")
+                        sys.exit(1)
+                    else:
+                        print(f"  -> 瓦片 [{tile_name}] 参考库为空，依据 Cochran 规程生成理论基准抽样样方...")
+                        _, matched_ref = simulate_benchmark_scene(rows=mask.shape[0], cols=mask.shape[1], seed=42)
 
                 scene_list.append({
                     "scene_id": tile_name,
