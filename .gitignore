@@ -1,0 +1,55 @@
+# ==============================================================================
+# 🌾 GACED30 遥感验证流水线 Git 忽略规则
+# ==============================================================================
+
+# --- 1. 待验源数据与参考真值目录 (data/) ---
+data/
+data/*
+data/**/*
+
+# 遥感超大栅格影像全局保护 (GitHub 100MB 限制)
+*.tif
+*.tiff
+*.TIF
+*.TIFF
+*.img
+*.nc
+*.hdf
+*.h5
+*.jp2
+*.geotiff
+*.zip
+*.rar
+*.tar.gz
+
+# --- 2. 运行输出成果目录 (output/) ---
+output/
+output/*
+output/**/*
+
+# --- 3. Python 编译与运行缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# --- 4. 虚拟环境与 IDE 配置 ---
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- 5. 操作系统临时文件与辅助执行文件 ---
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+powershell.cmd
+.powershell.cmd
