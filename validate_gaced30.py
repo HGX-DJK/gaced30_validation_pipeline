@@ -710,8 +710,53 @@ def parse_tile_coordinates(filename):
     return None
 
 
+def normalize_reference_columns(df):
+    """
+    智能归一化样点表列名，自适应中英文常见别名：
+    - 经度: lon, lng, longitude, x, 经度, point_x, coord_x
+    - 纬度: lat, latitude, y, 纬度, point_y, coord_y
+    - 验证真值: ref_label, ref, label, true_label, ground_truth, gt, class, code, type, 真值, 地类, 类型, 地类编码, 类别
+    - 遥感标签: map_label, pred, pred_label, map, 提取标签, 分类结果, 预测标签
+    """
+    if df is None or df.empty:
+        return df
+
+    col_mapping = {}
+    lon_aliases = ['lon', 'lng', 'longitude', 'x', '经度', 'point_x', 'coord_x']
+    lat_aliases = ['lat', 'latitude', 'y', '纬度', 'point_y', 'coord_y']
+    ref_aliases = ['ref_label', 'ref', 'label', 'true_label', 'ground_truth', 'gt', 'class', 'code', 'type', '真值', '地类', '类型', '地类编码', '类别']
+    map_aliases = ['map_label', 'pred', 'pred_label', 'map', '提取标签', '分类结果', '预测标签']
+
+    lower_cols = {str(c).lower().strip(): c for c in df.columns}
+
+    for alias in lon_aliases:
+        if alias in lower_cols and "lon" not in df.columns:
+            col_mapping[lower_cols[alias]] = "lon"
+            break
+
+    for alias in lat_aliases:
+        if alias in lower_cols and "lat" not in df.columns:
+            col_mapping[lower_cols[alias]] = "lat"
+            break
+
+    for alias in ref_aliases:
+        if alias in lower_cols and "ref_label" not in df.columns:
+            col_mapping[lower_cols[alias]] = "ref_label"
+            break
+
+    for alias in map_aliases:
+        if alias in lower_cols and "map_label" not in df.columns:
+            col_mapping[lower_cols[alias]] = "map_label"
+            break
+
+    if col_mapping:
+        df = df.rename(columns=col_mapping)
+    return df
+
+
 def match_reference_points_for_tile(ref_df, bounds):
     """从总参考真值表中根据经纬度空间边界自动筛选当前瓦片范围内的样点"""
+    ref_df = normalize_reference_columns(ref_df)
     if "lon" in ref_df.columns and "lat" in ref_df.columns and bounds is not None:
         lon_min, lat_min, lon_max, lat_max = bounds
         sub_df = ref_df[(ref_df["lon"] >= lon_min) & (ref_df["lon"] <= lon_max) &
@@ -815,6 +860,7 @@ def main():
             if rf.endswith(".csv"):
                 try:
                     master_ref_df = pd.read_csv(rf, comment="#")
+                    master_ref_df = normalize_reference_columns(master_ref_df)
                     print(f"  -> 装载主参考真值库: {os.path.basename(rf)} (共 {len(master_ref_df)} 条记录)")
                     break
                 except Exception:
@@ -845,6 +891,7 @@ def main():
                     for rf in ref_files:
                         if rf.endswith(".csv") and tile_name.lower() in os.path.basename(rf).lower():
                             matched_ref = pd.read_csv(rf, comment="#")
+                            matched_ref = normalize_reference_columns(matched_ref)
                             break
 
                 # 若参考点含地理坐标 (lon, lat) 但缺少遥感提取标签 map_label，从当前 GeoTIFF 中精确空间采样提取
@@ -865,15 +912,28 @@ def main():
                     for ref_tif_path in ref_tifs:
                         try:
                             with rasterio.open(ref_tif_path) as ref_src:
-                                ref_b = ref_src.bounds
+                                # 跨坐标系自动对齐 (如待验图为 WGS84 经纬度，参考图为 UTM 投影或墨卡托投影)
+                                crs_need_reproject = False
+                                if src.crs != ref_src.crs and src.crs is not None and ref_src.crs is not None:
+                                    try:
+                                        from rasterio.warp import transform_bounds
+                                        ref_b_left, ref_b_bottom, ref_b_right, ref_b_top = transform_bounds(ref_src.crs, src.crs, *ref_src.bounds)
+                                        crs_need_reproject = True
+                                    except Exception:
+                                        ref_b_left, ref_b_bottom, ref_b_right, ref_b_top = ref_src.bounds.left, ref_src.bounds.bottom, ref_src.bounds.right, ref_src.bounds.top
+                                else:
+                                    ref_b_left, ref_b_bottom, ref_b_right, ref_b_top = ref_src.bounds.left, ref_src.bounds.bottom, ref_src.bounds.right, ref_src.bounds.top
+
                                 # 计算空间重叠交集
-                                inter_left = max(bounds[0], ref_b.left)
-                                inter_right = min(bounds[2], ref_b.right)
-                                inter_bottom = max(bounds[1], ref_b.bottom)
-                                inter_top = min(bounds[3], ref_b.top)
+                                inter_left = max(bounds[0], ref_b_left)
+                                inter_right = min(bounds[2], ref_b_right)
+                                inter_bottom = max(bounds[1], ref_b_bottom)
+                                inter_top = min(bounds[3], ref_b_top)
 
                                 if inter_left < inter_right and inter_bottom < inter_top:
                                     print(f"  -> 🎯 发现参考栅格 [{os.path.basename(ref_tif_path)}] 与当前待验影像存在空间重叠交集！")
+                                    if crs_need_reproject:
+                                        print(f"     🌐 自动识别跨坐标系投影: 待验图 [{src.crs}] ⟷ 参考图 [{ref_src.crs}]，已无缝完成空间投影重对齐")
                                     print(f"     交集范围: 经度 [{inter_left:.2f} ~ {inter_right:.2f}°E], 纬度 [{inter_bottom:.2f} ~ {inter_top:.2f}°N]")
                                     
                                     # 1. 严格空间对齐：提取相交窗口内的待验分类栅格 (按需局部读取，无需载入整景亿级大图)
@@ -939,7 +999,13 @@ def main():
                                     map_labels = [1] * len(crop_xs) + [0] * len(noncrop_xs)
 
                                     coords = list(zip(all_xs, all_ys))
-                                    sampled_ref = [v[0] for v in ref_src.sample(coords, indexes=1)]
+                                    if crs_need_reproject:
+                                        from rasterio.warp import transform
+                                        sample_xs, sample_ys = transform(src.crs, ref_src.crs, all_xs, all_ys)
+                                        ref_coords = list(zip(sample_xs, sample_ys))
+                                    else:
+                                        ref_coords = coords
+                                    sampled_ref = [v[0] for v in ref_src.sample(ref_coords, indexes=1)]
 
                                     matched_ref = pd.DataFrame({
                                         "lon": all_xs,
@@ -959,7 +1025,7 @@ def main():
                                 else:
                                     print(f"\n  -> ⚠️ 【空间地理范围不重叠提示】:")
                                     print(f"     • 待验影像 [{tile_name}]: 经度 {bounds[0]:.1f}~{bounds[2]:.1f}°E, 纬度 {bounds[1]:.1f}~{bounds[3]:.1f}°N (位于中国内蒙古中蒙边境)")
-                                    print(f"     • 参考图层 [{os.path.basename(ref_tif_path)}]: 经度 {ref_b.left:.1f}~{ref_b.right:.1f}°E, 纬度 {ref_b.bottom:.1f}~{ref_b.top:.1f}°N (位于俄罗斯西伯利亚/远东)")
+                                    print(f"     • 参考图层 [{os.path.basename(ref_tif_path)}]: 经度 {ref_b_left:.1f}~{ref_b_right:.1f}°E, 纬度 {ref_b_bottom:.1f}~{ref_b_top:.1f}°N (对齐后地理坐标)")
                                     print(f"     • 两者空间相距 1,500+ 公里，地理交集面积为 0！无法在该参考图上进行同区域比对。")
                         except Exception as e:
                             pass
