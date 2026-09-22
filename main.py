@@ -35,9 +35,13 @@ import re
 import glob
 import argparse
 import datetime
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+# 过滤 NumPy 2.5+ 与 Rasterio 底层 C-API 之间的弃用提示 (不影响运行和结果)
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*Setting the shape on a NumPy array.*")
 
 # 兼容 Windows 控制台输出编码
 if sys.platform.startswith("win"):
@@ -51,6 +55,7 @@ if sys.platform.startswith("win"):
 # 尝试导入遥感地理库
 try:
     import rasterio
+    from rasterio.windows import from_bounds
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
@@ -61,6 +66,11 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 PRESET_SCHEMES = {
+    "fromglc": {
+        "name": "FROM-GLC 10m (清华大学全球地表覆被)",
+        "crop_values": [10],
+        "desc": "10=耕地(Cropland), 20=林地, 30=草地, 40=灌木, 50=湿地, 60=水体, 70=苔原, 80=不透水面, 90=裸地, 100=雪/冰"
+    },
     "esa_worldcover": {
         "name": "ESA WorldCover 10m",
         "crop_values": [40],
@@ -150,8 +160,15 @@ def harmonize_reference_labels(series, preset="auto", custom_crop_values=None):
         mapped = np.array([1 if int(float(x)) in crop_vals else 0 for x in series], dtype=np.int64)
         return mapped, f"按指定预设体系 [{sch['name']}] 映射: {crop_vals}->耕地(1), 其余->非耕地(0)"
 
-    # 自动识别 ESA WorldCover 10m (以 40 为耕地，其它为 10, 20, 30, 50, 60, 80...)
-    if 40 in unique_vals and (10 in unique_vals or 20 in unique_vals or 30 in unique_vals or 50 in unique_vals or 80 in unique_vals):
+    # 自动识别 FROM-GLC 10m 或 GlobeLand30 (以 10 为耕地，20/30/80/90 等为非耕地)
+    if (10 in unique_vals and (90 in unique_vals or 80 in unique_vals or 30 in unique_vals)) and (40 not in unique_vals or 90 in unique_vals):
+        sch = PRESET_SCHEMES["fromglc"]
+        crop_vals = set(sch["crop_values"])
+        mapped = np.array([1 if int(float(x)) in crop_vals else 0 for x in series], dtype=np.int64)
+        return mapped, f"自动识别为【{sch['name']}】: 像元编码 10->耕地(1), 其余(20/30/80/90...)->非耕地(0)"
+
+    # 自动识别 ESA WorldCover 10m (以 40 为耕地，其它为 10, 20, 30, 50, 60, 80... 不含90裸地)
+    if 40 in unique_vals and 90 not in unique_vals and (10 in unique_vals or 20 in unique_vals or 30 in unique_vals or 50 in unique_vals or 80 in unique_vals):
         sch = PRESET_SCHEMES["esa_worldcover"]
         crop_vals = set(sch["crop_values"])
         mapped = np.array([1 if int(float(x)) in crop_vals else 0 for x in series], dtype=np.int64)
@@ -303,13 +320,13 @@ class GACED30Validator:
         else:
             defensibility_badge = "⚠️ 抽样变异较大 (C级-需补样)"
 
-        # 导出单景 CSV
+        # 导出单景 CSV (严格以耕地自身专项指标为核心，彻底剔除易产生假象的全图 OA)
         df_acc = pd.DataFrame([
-            {"指标类别": "全图精度", "指标名称": "总体精度 (OA)", "量化数值": f"{OA*100:.2f}%", "标准差 (SE)": f"±{SE_OA*100:.2f}%", "合格门槛": "≥ 85.0%"},
-            {"指标类别": "耕地精度", "指标名称": "用户精度 (UA / 查准率)", "量化数值": f"{UA_crop*100:.2f}%", "标准差 (SE)": f"±{SE_UA_crop*100:.2f}%", "合格门槛": f"错报率 = {Commission_crop*100:.2f}%"},
-            {"指标类别": "耕地精度", "指标名称": "生产者精度 (PA / 查全率)", "量化数值": f"{PA_crop*100:.2f}%", "标准差 (SE)": f"±{SE_PA_crop*100:.2f}%", "合格门槛": f"漏报率 = {Omission_crop*100:.2f}%"},
-            {"指标类别": "综合平衡", "指标名称": "F1-Score", "量化数值": f"{F1_crop:.4f}", "标准差 (SE)": "-", "合格门槛": "≥ 0.8500"},
-            {"指标类别": "几何重合", "指标名称": "交并比 (IoU)", "量化数值": f"{IoU_crop:.4f}", "标准差 (SE)": "-", "合格门槛": "0.75~0.85"}
+            {"指标类别": "核心耕地", "指标名称": "耕地综合总体精度 (F1-Score)", "量化数值": f"{F1_crop*100:.2f}%", "标准差 (SE)": "-", "合格门槛与规范说明": "推荐 ≥ 85.0% (纯耕地综合质检核心)"},
+            {"指标类别": "核心耕地", "指标名称": "耕地用户精度 (UA / 查准率)", "量化数值": f"{UA_crop*100:.2f}%", "标准差 (SE)": f"±{SE_UA_crop*100:.2f}%", "合格门槛与规范说明": f"虚报/错报率 = {Commission_crop*100:.2f}% (重点核心指标)"},
+            {"指标类别": "核心耕地", "指标名称": "耕地生产者精度 (PA / 查全率)", "量化数值": f"{PA_crop*100:.2f}%", "标准差 (SE)": f"±{SE_PA_crop*100:.2f}%", "合格门槛与规范说明": f"漏报/欠报率 = {Omission_crop*100:.2f}% (重点核心指标)"},
+            {"指标类别": "几何重合", "指标名称": "耕地空间交并比 (IoU)", "量化数值": f"{IoU_crop*100:.2f}%", "标准差 (SE)": "-", "合格门槛与规范说明": "小农破碎带优良线 75%~85%"},
+            {"指标类别": "面积校准", "指标名称": "直接数像元偏差率 (Bias%)", "量化数值": f"{bias_percent:+.2f}%", "标准差 (SE)": "-", "合格门槛与规范说明": "直接数像素面积与联合国无偏面积的偏离度"}
         ])
         df_acc.to_csv(os.path.join(output_scene_dir, "accuracy_metrics.csv"), index=False, encoding="utf-8-sig")
 
@@ -406,13 +423,13 @@ class GACED30Validator:
         else:
             grand_badge = "⚠️ 抽样变异较大 (C级-需增加样方)"
 
-        # 构造多景汇总对比台账 (CSV)
+        # 构造多景汇总对比台账 (CSV) - 严格以耕地专项精度为绝对核心
         summary_rows = []
         for r in scene_results:
             summary_rows.append({
                 "区域/瓦片标识 (Scene ID)": r["scene_id"],
                 "地理空间范围 (Bounds)": str(r["bounds"]),
-                "全区总幅员 (km²)": round(r["total_area_km2"], 2),
+                "有效校验幅员 (km²)": round(r["total_area_km2"], 2),
                 "待验数像元面积 (km²)": round(r["naive_crop_km2"], 2),
                 "联合国无偏面积 (km²)": round(r["calibrated_crop_km2"], 2),
                 "无偏面积(万亩)": round(r["calibrated_crop_km2"] * 0.15, 2),
@@ -420,11 +437,10 @@ class GACED30Validator:
                 "解析标准误 (SE km²)": f"±{r['SE_area_km2']:.2f}",
                 "变异系数 (CV%)": f"{r['CV_percent']:.2f}%",
                 "95% 置信区间 (km²)": f"[{r['ci_km2'][0]:.1f} ~ {r['ci_km2'][1]:.1f}]",
-                "总体精度 (OA)": f"{r['OA']*100:.2f}%",
-                "用户精度 (UA)": f"{r['UA_crop']*100:.2f}%",
-                "生产者精度 (PA)": f"{r['PA_crop']*100:.2f}%",
-                "F1-Score": f"{r['F1_crop']:.4f}",
-                "交并比 (IoU)": f"{r['IoU_crop']:.4f}",
+                "耕地综合总体精度 (F1)": f"{r['F1_crop']*100:.2f}%",
+                "耕地查准率 (UA)": f"{r['UA_crop']*100:.2f}%",
+                "耕地查全率 (PA)": f"{r['PA_crop']*100:.2f}%",
+                "耕地交并比 (IoU)": f"{r['IoU_crop']:.4f}",
                 "检验样点数": int(r["n_samples"]),
                 "官方采信评级": r["defensibility_badge"]
             })
@@ -433,7 +449,7 @@ class GACED30Validator:
         summary_rows.append({
             "区域/瓦片标识 (Scene ID)": "【跨区全景联合汇总 Grand Total】",
             "地理空间范围 (Bounds)": f"涵盖 {n_scenes} 个独立农区瓦片",
-            "全区总幅员 (km²)": round(grand_total_area_km2, 2),
+            "有效校验幅员 (km²)": round(grand_total_area_km2, 2),
             "待验数像元面积 (km²)": round(grand_naive_crop_km2, 2),
             "联合国无偏面积 (km²)": round(grand_calibrated_crop_km2, 2),
             "无偏面积(万亩)": round(grand_calibrated_crop_km2 * 0.15, 2),
@@ -441,11 +457,10 @@ class GACED30Validator:
             "解析标准误 (SE km²)": f"±{grand_se_area_km2:.2f}",
             "变异系数 (CV%)": f"{grand_cv_percent:.2f}%",
             "95% 置信区间 (km²)": f"[{grand_ci_lower_km2:.1f} ~ {grand_ci_upper_km2:.1f}]",
-            "总体精度 (OA)": f"{grand_oa*100:.2f}%",
-            "用户精度 (UA)": f"{grand_ua*100:.2f}%",
-            "生产者精度 (PA)": f"{grand_pa*100:.2f}%",
-            "F1-Score": f"{grand_f1:.4f}",
-            "交并比 (IoU)": "-",
+            "耕地综合总体精度 (F1)": f"{grand_f1*100:.2f}%",
+            "耕地查准率 (UA)": f"{grand_ua*100:.2f}%",
+            "耕地查全率 (PA)": f"{grand_pa*100:.2f}%",
+            "耕地交并比 (IoU)": "-",
             "检验样点数": sum(int(r["n_samples"]) for r in scene_results),
             "官方采信评级": grand_badge
         })
@@ -482,8 +497,9 @@ class GACED30Validator:
         print(f"   • 跨区直接数像元偏差率 : {grand_bias_percent:+.2f}%")
         print(f"   • 联合解析标准误 (SE)  : ±{grand_se_area_km2:.2f} km²")
         print(f"   • 联合变异系数 (CV%)   : {grand_cv_percent:.2f}% (方差通过跨区分层联合收敛)")
-        print(f"   • 联合总体精度 (OA)    : {grand_oa*100:.2f}%")
-        print(f"   • 联合查准/查全 (UA/PA): UA={grand_ua*100:.2f}%, PA={grand_pa*100:.2f}% (F1={grand_f1:.4f})")
+        print(f"   • 耕地综合总体精度 (F1): {grand_f1*100:.2f}% (核心指标: 纯耕地综合质量)")
+        print(f"   • 耕地制图查准率 (UA)  : {grand_ua*100:.2f}% (错报/虚警率: {(1.0-grand_ua)*100:.2f}%)")
+        print(f"   • 耕地地面查全率 (PA)  : {grand_pa*100:.2f}% (漏报/欠报率: {(1.0-grand_pa)*100:.2f}%)")
         print(f"{'='*80}")
         print(f"🎉 全部交付物生成完毕:")
         print(f"   • 📊 多景对比总台账:   {summary_csv_path}")
@@ -494,14 +510,14 @@ class GACED30Validator:
         return df_summary
 
     def _generate_multi_scene_visuals(self, scene_results, grand_summary, output_plot):
-        """生成多景多区域对比分析图表"""
+        """生成多景多区域对比分析图表 (严格以耕地专项精度为呈现基准)"""
         n_scenes = len(scene_results)
         sids = [r["scene_id"] for r in scene_results]
         naive_areas = [r["naive_crop_km2"] for r in scene_results]
         calibrated_areas = [r["calibrated_crop_km2"] for r in scene_results]
         ses = [r["SE_area_km2"] * self.z_score for r in scene_results]
 
-        oas = [r["OA"] * 100 for r in scene_results]
+        f1s = [r["F1_crop"] * 100 for r in scene_results]
         uas = [r["UA_crop"] * 100 for r in scene_results]
         pas = [r["PA_crop"] * 100 for r in scene_results]
 
@@ -520,17 +536,17 @@ class GACED30Validator:
         ax1.grid(axis='y', linestyle='--', alpha=0.5)
         ax1.legend(loc='upper right')
 
-        # 2. 各区域精度指标对比 (OA, UA, PA)
+        # 2. 各区域耕地专项制图精度对比 (UA, PA, F1)
         w3 = 0.25
-        ax2.bar(x - w3, oas, w3, label="总体精度 (OA %)", color="#3498db", alpha=0.85)
-        ax2.bar(x, uas, w3, label="用户精度 (UA / 查准率 %)", color="#f39c12", alpha=0.85)
-        ax2.bar(x + w3, pas, w3, label="生产者精度 (PA / 查全率 %)", color="#9b59b6", alpha=0.85)
-        ax2.set_ylabel("精度百分比 (%)", fontsize=11, fontweight="bold")
-        ax2.set_title("图 B. 各景空间制图精度 (OA, UA, PA) 对比一览", fontsize=12, pad=10)
+        ax2.bar(x - w3, uas, w3, label="耕地查准率 (UA %)", color="#2980b9", alpha=0.85)
+        ax2.bar(x, pas, w3, label="耕地查全率 (PA %)", color="#27ae60", alpha=0.85)
+        ax2.bar(x + w3, f1s, w3, label="耕地综合总体精度 (F1 %)", color="#e67e22", alpha=0.85)
+        ax2.set_ylabel("耕地精度百分比 (%)", fontsize=11, fontweight="bold")
+        ax2.set_title("图 B. 各景【耕地专项制图精度】(查准率 UA, 查全率 PA, 综合 F1) 对比一览 (纯耕地评估)", fontsize=12, pad=10)
         ax2.set_xticks(x)
         ax2.set_xticklabels(sids, rotation=15 if n_scenes > 4 else 0, fontsize=10)
-        ax2.set_ylim(50, 105)
-        ax2.axhline(85, color="#e74c3c", linestyle=":", label="联合国合格参考红线 (85%)")
+        ax2.set_ylim(0, 105)
+        ax2.axhline(85, color="#e74c3c", linestyle=":", label="联合国优良参考红线 (85%)")
         ax2.grid(axis='y', linestyle='--', alpha=0.5)
         ax2.legend(loc='lower right')
 
@@ -549,17 +565,17 @@ class GACED30Validator:
             table_rows += f"""<tr style="{style}">
                 <td>{r['区域/瓦片标识 (Scene ID)']}</td>
                 <td style="color:#666; font-size:12px;">{r['地理空间范围 (Bounds)']}</td>
-                <td>{r['全区总幅员 (km²)']}</td>
+                <td>{r['有效校验幅员 (km²)']}</td>
                 <td style="color:#c0392b;">{r['待验数像元面积 (km²)']}</td>
                 <td style="color:#27ae60;">{r['联合国无偏面积 (km²)']}</td>
                 <td style="color:#d35400;">{r['无偏面积(万亩)']}</td>
                 <td>{r['直接数像元偏差率']}</td>
                 <td>{r['解析标准误 (SE km²)']}</td>
                 <td><b>{r['变异系数 (CV%)']}</b></td>
-                <td><b>{r['总体精度 (OA)']}</b></td>
-                <td>{r['用户精度 (UA)']}</td>
-                <td>{r['生产者精度 (PA)']}</td>
-                <td>{r['F1-Score']}</td>
+                <td style="color:#d35400; font-weight:bold;">{r['耕地综合总体精度 (F1)']}</td>
+                <td style="color:#2980b9; font-weight:bold;">{r['耕地查准率 (UA)']}</td>
+                <td style="color:#27ae60; font-weight:bold;">{r['耕地查全率 (PA)']}</td>
+                <td>{r['耕地交并比 (IoU)']}</td>
                 <td><span style="font-size:12px;">{r['官方采信评级']}</span></td>
             </tr>"""
 
@@ -600,32 +616,37 @@ class GACED30Validator:
         <div class="badge" style="margin-top:10px;">{grand_summary['grand_badge']} (共校验 {grand_summary['n_scenes']} 个独立农区瓦片)</div>
     </div>
 
+    <!-- 纯耕地考核说明 -->
+    <div style="background:#fef9e7; border:1px solid #f9e79f; border-left:5px solid #f39c12; border-radius:6px; padding:12px 18px; margin:20px 0; font-size:13px; color:#7d6608;">
+        <b>💡 纯耕地专属精度考核说明</b>：遵循《联合国农业统计遥感手册》规范，本系统已彻底剔除容易产生高精度假象的“全图背景包含度 (OA)”，全套评估指标与 KPI 驾驶舱<strong>100% 仅针对耕地自身的制图查准率 (UA)、查全率 (PA)、综合质量 (F1-Score) 与真实无偏面积</strong>进行严密评定。
+    </div>
+
     <!-- 跨区联合总览 KPI -->
     <div class="kpi-grid">
-        <div class="kpi-item" style="border-left-color: #3498db;">
-            <div class="kpi-title">全域总幅员覆盖</div>
-            <div class="kpi-val">{grand_summary['grand_total_area']:,.1f} km²</div>
-            <div class="kpi-desc">涵盖 {grand_summary['n_scenes']} 个独立空间瓦片</div>
-        </div>
         <div class="kpi-item" style="border-left-color: #27ae60;">
             <div class="kpi-title">联合国联合无偏面积</div>
             <div class="kpi-val">{grand_summary['grand_calibrated']:,.1f} km²</div>
-            <div class="kpi-desc">{grand_summary['grand_calibrated']*0.15:,.1f} 万亩 (无偏校准)</div>
+            <div class="kpi-desc">{grand_summary['grand_calibrated']*0.15:,.1f} 万亩 (无偏校准基准)</div>
         </div>
-        <div class="kpi-item" style="border-left-color: #e74c3c;">
-            <div class="kpi-title">数像元系统偏差 (Bias)</div>
+        <div class="kpi-item" style="border-left-color: #2980b9;">
+            <div class="kpi-title">耕地用户精度 (查准率 UA)</div>
+            <div class="kpi-val">{grand_summary['grand_ua']*100:.2f}%</div>
+            <div class="kpi-desc">错报/虚警率 {(1.0-grand_summary['grand_ua'])*100:.2f}% (重点核心)</div>
+        </div>
+        <div class="kpi-item" style="border-left-color: #8e44ad;">
+            <div class="kpi-title">耕地生产者精度 (查全率 PA)</div>
+            <div class="kpi-val">{grand_summary['grand_pa']*100:.2f}%</div>
+            <div class="kpi-desc">漏报/欠报率 {(1.0-grand_summary['grand_pa'])*100:.2f}% (重点核心)</div>
+        </div>
+        <div class="kpi-item" style="border-left-color: #d35400;">
+            <div class="kpi-title">综合总体精度 (F1-Score)</div>
+            <div class="kpi-val">{grand_summary['grand_f1']*100:.2f}%</div>
+            <div class="kpi-desc">推荐门槛 ≥ 85.0% (纯耕地综合质检)</div>
+        </div>
+        <div class="kpi-item" style="border-left-color: #c0392b;">
+            <div class="kpi-title">直接数像元系统偏差 (Bias)</div>
             <div class="kpi-val">{grand_summary['grand_bias_pct']:+.2f}%</div>
-            <div class="kpi-desc">数像元面积 {grand_summary['grand_naive']:,.1f} km²</div>
-        </div>
-        <div class="kpi-item" style="border-left-color: #9b59b6;">
-            <div class="kpi-title">联合变异系数 (CV%)</div>
-            <div class="kpi-val">{grand_summary['grand_cv']:.2f}%</div>
-            <div class="kpi-desc">SE: ±{grand_summary['grand_se']:,.1f} km² (达发布红线)</div>
-        </div>
-        <div class="kpi-item" style="border-left-color: #f39c12;">
-            <div class="kpi-title">面积加权总体精度 (OA)</div>
-            <div class="kpi-val">{grand_summary['grand_oa']*100:.2f}%</div>
-            <div class="kpi-desc">全区加权分类准确率</div>
+            <div class="kpi-desc">数像元面积 {grand_summary['grand_naive']:,.1f} km² (虚报高估)</div>
         </div>
     </div>
 
@@ -638,17 +659,17 @@ class GACED30Validator:
                     <tr>
                         <th>区域/瓦片标识</th>
                         <th>空间范围</th>
-                        <th>总幅员(km²)</th>
+                        <th>有效校验幅员(km²)</th>
                         <th>数像素面积(km²)</th>
                         <th>无偏面积(km²)</th>
                         <th>无偏面积(万亩)</th>
                         <th>偏差率</th>
                         <th>标准误(SE)</th>
                         <th>变异系数(CV)</th>
-                        <th>总体精度(OA)</th>
-                        <th>查准率(UA)</th>
-                        <th>查全率(PA)</th>
-                        <th>F1-Score</th>
+                        <th style="color:#d35400;">耕地综合总体精度(F1)</th>
+                        <th style="color:#2980b9;">耕地查准率(UA)</th>
+                        <th style="color:#27ae60;">耕地查全率(PA)</th>
+                        <th>耕地交并比(IoU)</th>
                         <th>官方采信评级</th>
                     </tr>
                 </thead>
@@ -744,7 +765,7 @@ def main():
     parser.add_argument("--ref-dir", type=str, default=ref_dir, help="参考真值数据文件夹路径 (默认: data/reference_data)")
     parser.add_argument("--output-dir", type=str, default=default_out, help="成果输出目录 (默认: ./output)")
     parser.add_argument("--year", type=int, default=2024, help="待评估目标年份 (默认: 2024)")
-    parser.add_argument("--ref-preset", type=str, default="auto", choices=["auto", "binary", "esa_worldcover", "esri_10m", "globeland30", "clcd", "cnlucc", "worldcereal"], help="参考真值分类体系预设 (默认: auto 智能自适应)")
+    parser.add_argument("--ref-preset", type=str, default="auto", choices=["auto", "binary", "fromglc", "esa_worldcover", "esri_10m", "globeland30", "clcd", "cnlucc", "worldcereal"], help="参考真值分类体系预设 (默认: auto 智能自适应)")
     parser.add_argument("--ref-crop-values", type=str, default="", help="自定义参考真值中判定为耕地的类别编码/像元值 (逗号分隔，如 '40' 或 '11,12')")
     parser.add_argument("--demo", action="store_true", help="强制启动多景多区域仿真演示模式")
     args = parser.parse_args()
@@ -857,20 +878,56 @@ def main():
                                 if inter_left < inter_right and inter_bottom < inter_top:
                                     print(f"  -> 🎯 发现参考栅格 [{os.path.basename(ref_tif_path)}] 与当前待验影像存在空间重叠交集！")
                                     print(f"     交集范围: 经度 [{inter_left:.2f} ~ {inter_right:.2f}°E], 纬度 [{inter_bottom:.2f} ~ {inter_top:.2f}°N]")
-                                    n_pts = 600
-                                    xs = np.random.uniform(inter_left, inter_right, n_pts)
-                                    ys = np.random.uniform(inter_bottom, inter_top, n_pts)
-                                    coords = list(zip(xs, ys))
-                                    sampled_map = [v[0] for v in src.sample(coords, indexes=target_band)]
+                                    
+                                    # 1. 严格空间对齐：提取相交窗口内的待验分类栅格
+                                    src_win = from_bounds(inter_left, inter_bottom, inter_right, inter_top, src.transform)
+                                    raw_inter = src.read(target_band, window=src_win)
+                                    src_win_transform = src.window_transform(src_win)
+                                    
+                                    mask_inter = np.full_like(raw_inter, 255, dtype=np.uint8)
+                                    mask_inter[raw_inter == 0] = 0
+                                    mask_inter[(raw_inter == 10) | (raw_inter == 1)] = 1
+                                    
+                                    # 2. 联合国规范：在重叠区内执行【分层随机抽样 (Stratified Random Sampling)】
+                                    #    分别在耕地层与非耕地层中各抽取 300 个均衡样本，消除样本匮乏与统计方差虚大
+                                    crop_rc = np.argwhere(mask_inter == 1)
+                                    noncrop_rc = np.argwhere(mask_inter == 0)
+                                    
+                                    n_sample_each = 300
+                                    n_crop_avail = len(crop_rc)
+                                    n_noncrop_avail = len(noncrop_rc)
+                                    
+                                    sel_crop_n = min(n_sample_each, n_crop_avail)
+                                    sel_noncrop_n = min(n_sample_each, n_noncrop_avail)
+                                    
+                                    np.random.seed(42)
+                                    sel_crop_idx = np.random.choice(n_crop_avail, size=sel_crop_n, replace=False) if n_crop_avail > 0 else np.empty(0, dtype=int)
+                                    sel_noncrop_idx = np.random.choice(n_noncrop_avail, size=sel_noncrop_n, replace=False) if n_noncrop_avail > 0 else np.empty(0, dtype=int)
+                                    
+                                    crop_xs, crop_ys = rasterio.transform.xy(src_win_transform, crop_rc[sel_crop_idx, 0], crop_rc[sel_crop_idx, 1]) if sel_crop_n > 0 else ([], [])
+                                    noncrop_xs, noncrop_ys = rasterio.transform.xy(src_win_transform, noncrop_rc[sel_noncrop_idx, 0], noncrop_rc[sel_noncrop_idx, 1]) if sel_noncrop_n > 0 else ([], [])
+                                    
+                                    all_xs = list(crop_xs) + list(noncrop_xs)
+                                    all_ys = list(crop_ys) + list(noncrop_ys)
+                                    map_labels = [1] * len(crop_xs) + [0] * len(noncrop_xs)
+                                    
+                                    coords = list(zip(all_xs, all_ys))
                                     sampled_ref = [v[0] for v in ref_src.sample(coords, indexes=1)]
+                                    
                                     matched_ref = pd.DataFrame({
-                                        "lon": xs, "lat": ys,
-                                        "map_label": [1 if (v == 10 or v == 1) else (0 if v == 0 else 255) for v in sampled_map],
+                                        "lon": all_xs,
+                                        "lat": all_ys,
+                                        "map_label": map_labels,
                                         "ref_label": sampled_ref,
                                         "weight": 1.0
                                     })
                                     matched_ref = matched_ref[matched_ref["map_label"] != 255].copy()
-                                    print(f"     已在空间相交重叠区成功原位采样 {len(matched_ref)} 个真实对照检验点！")
+                                    
+                                    # 将评估基准掩膜与边界严格绑定到实际相交有效区域
+                                    mask = mask_inter
+                                    bounds = (inter_left, inter_bottom, inter_right, inter_top)
+                                    print(f"     ✅ 成功完成分层随机抽样: 耕地层抽取 {len(crop_xs)} 点，非耕地层抽取 {len(noncrop_xs)} 点 (共 {len(matched_ref)} 个均衡检验点)！")
+                                    print(f"     ✅ 评估总体与地类权重严格对齐至重叠区面积 (避免全图大范围权重错配)")
                                     break
                                 else:
                                     print(f"\n  -> ⚠️ 【空间地理范围不重叠提示】:")
