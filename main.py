@@ -217,11 +217,11 @@ class GACED30Validator:
         """对单景耕地二值图进行联合国标准量化评估"""
         os.makedirs(output_scene_dir, exist_ok=True)
 
-        valid_mask = (map_binary_mask != 255)
-        total_valid_pixels = np.sum(valid_mask)
         # GACED30 官方语义规范: 10=耕地, 0=非耕地, 255=NoData; 兼容处理 1=耕地
-        crop_pixels = np.sum(valid_mask & ((map_binary_mask == 1) | (map_binary_mask == 10)))
-        noncrop_pixels = np.sum(valid_mask & (map_binary_mask == 0))
+        # 使用 np.count_nonzero 直接在原始掩膜上快速统计，彻底避免创建多份千万级元素 boolean 临时数组
+        crop_pixels = int(np.count_nonzero((map_binary_mask == 1) | (map_binary_mask == 10)))
+        noncrop_pixels = int(np.count_nonzero(map_binary_mask == 0))
+        total_valid_pixels = crop_pixels + noncrop_pixels
 
         if total_valid_pixels == 0:
             raise ValueError(f"景 [{scene_id}] 有效像元总数为 0，请检查输入栅格。")
@@ -386,11 +386,12 @@ class GACED30Validator:
 
             print(f"\n[{idx+1}/{n_scenes}] 正在处理区域/瓦片: {sid} (范围: {bounds})...")
             res = self.evaluate_single_scene(sid, mask, ref_df, out_s_dir, year=year)
+            sc["mask"] = None  # 及时释放单景大栅格内存，支持百景大批量处理防爆内存
             res["bounds"] = bounds
             res["multi_cube"] = sc.get("multi_cube", None)
             scene_results.append(res)
             print(f"   -> 面积: 待验数像元={res['naive_crop_km2']:,.1f} km² | 联合国无偏={res['calibrated_crop_km2']:,.1f} km² (SE: ±{res['SE_area_km2']:.1f} km², CV: {res['CV_percent']:.2f}%)")
-            print(f"   -> 精度: OA={res['OA']*100:.2f}%, UA={res['UA_crop']*100:.2f}%, PA={res['PA_crop']*100:.2f}%, F1={res['F1_crop']:.3f}")
+            print(f"   -> 耕地精度: F1={res['F1_crop']*100:.2f}%, UA(查准)={res['UA_crop']*100:.2f}%, PA(查全)={res['PA_crop']*100:.2f}%, IoU={res['IoU_crop']*100:.2f}%")
 
         # -----------------------------------------------------------------------------------------
         # 联合国手册第 22-24 章：跨区域/多景分层联合无偏推断 (Stratified Cross-Domain Aggregation)
@@ -827,15 +828,11 @@ def main():
                 bounds = (src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top)
                 if n_bands >= 25:
                     target_band = min(max(1, args.year - 2000 + 1), 25)
-                    raw_mask = src.read(target_band)
                 else:
                     target_band = 1
-                    raw_mask = src.read(1)
 
-                # 标准化耕地二值编码 (根据 GACED30 官方规范: 0=非耕地, 10=耕地, 255=NoData; 兼容 1=耕地)
-                mask = np.full_like(raw_mask, 255, dtype=np.uint8)
-                mask[raw_mask == 0] = 0
-                mask[(raw_mask == 10) | (raw_mask == 1)] = 1
+                # 内存优化：延迟加载大栅格，先通过元数据 bounds 判断空间重叠，避免盲目读取整图引发 OOM
+                mask = None
 
                 # 匹配参考真值
                 matched_ref = pd.DataFrame()
@@ -879,41 +876,71 @@ def main():
                                     print(f"  -> 🎯 发现参考栅格 [{os.path.basename(ref_tif_path)}] 与当前待验影像存在空间重叠交集！")
                                     print(f"     交集范围: 经度 [{inter_left:.2f} ~ {inter_right:.2f}°E], 纬度 [{inter_bottom:.2f} ~ {inter_top:.2f}°N]")
                                     
-                                    # 1. 严格空间对齐：提取相交窗口内的待验分类栅格
+                                    # 1. 严格空间对齐：提取相交窗口内的待验分类栅格 (按需局部读取，无需载入整景亿级大图)
                                     src_win = from_bounds(inter_left, inter_bottom, inter_right, inter_top, src.transform)
                                     raw_inter = src.read(target_band, window=src_win)
                                     src_win_transform = src.window_transform(src_win)
                                     
-                                    mask_inter = np.full_like(raw_inter, 255, dtype=np.uint8)
-                                    mask_inter[raw_inter == 0] = 0
-                                    mask_inter[(raw_inter == 10) | (raw_inter == 1)] = 1
+                                    # 向量化直接编码映射 (0=非耕地, 1=耕地, 255=NoData)，立即释放原始切片
+                                    mask_inter = np.where((raw_inter == 10) | (raw_inter == 1), np.uint8(1), np.where(raw_inter == 0, np.uint8(0), np.uint8(255)))
+                                    del raw_inter
                                     
                                     # 2. 联合国规范：在重叠区内执行【分层随机抽样 (Stratified Random Sampling)】
-                                    #    分别在耕地层与非耕地层中各抽取 300 个均衡样本，消除样本匮乏与统计方差虚大
-                                    crop_rc = np.argwhere(mask_inter == 1)
-                                    noncrop_rc = np.argwhere(mask_inter == 0)
-                                    
+                                    #    分别在耕地层与非耕地层中各抽取 300 个均衡样本
+                                    #    🔥 内存与性能极限优化：使用 1D 稀疏扁平索引与常数级 O(1) 批量拒绝抽样，彻底消除 np.argwhere 带来的数千万坐标与近 1GB 内存暴涨
                                     n_sample_each = 300
-                                    n_crop_avail = len(crop_rc)
-                                    n_noncrop_avail = len(noncrop_rc)
-                                    
-                                    sel_crop_n = min(n_sample_each, n_crop_avail)
-                                    sel_noncrop_n = min(n_sample_each, n_noncrop_avail)
-                                    
+                                    H, W_dim = mask_inter.shape
+                                    total_pixels = mask_inter.size
                                     np.random.seed(42)
-                                    sel_crop_idx = np.random.choice(n_crop_avail, size=sel_crop_n, replace=False) if n_crop_avail > 0 else np.empty(0, dtype=int)
-                                    sel_noncrop_idx = np.random.choice(n_noncrop_avail, size=sel_noncrop_n, replace=False) if n_noncrop_avail > 0 else np.empty(0, dtype=int)
-                                    
-                                    crop_xs, crop_ys = rasterio.transform.xy(src_win_transform, crop_rc[sel_crop_idx, 0], crop_rc[sel_crop_idx, 1]) if sel_crop_n > 0 else ([], [])
-                                    noncrop_xs, noncrop_ys = rasterio.transform.xy(src_win_transform, noncrop_rc[sel_noncrop_idx, 0], noncrop_rc[sel_noncrop_idx, 1]) if sel_noncrop_n > 0 else ([], [])
-                                    
+
+                                    # 耕地层：耕地相对稀疏，使用 1D flatnonzero，内存占用仅数兆
+                                    crop_flat = np.flatnonzero(mask_inter == 1)
+                                    n_crop_avail = len(crop_flat)
+                                    sel_crop_n = min(n_sample_each, n_crop_avail)
+                                    if sel_crop_n > 0:
+                                        sel_crop_idx = np.random.choice(n_crop_avail, size=sel_crop_n, replace=False)
+                                        crop_r, crop_c = np.unravel_index(crop_flat[sel_crop_idx], (H, W_dim))
+                                        crop_xs, crop_ys = rasterio.transform.xy(src_win_transform, crop_r, crop_c)
+                                    else:
+                                        crop_xs, crop_ys = [], []
+
+                                    # 非耕地层：遥感大田中通常占 90%+ 的绝对优势层
+                                    # 采用【批量拒绝抽样 (Batch Rejection Sampling)】：常数级 O(1) 极小内存，毫秒级快速收敛
+                                    flat_view = mask_inter.ravel()
+                                    selected_noncrop_flat = []
+                                    batch_size = n_sample_each * 4
+                                    for _ in range(5):
+                                        cands = np.random.randint(0, total_pixels, size=batch_size)
+                                        valid_cands = cands[flat_view[cands] == 0]
+                                        for c in valid_cands:
+                                            if c not in selected_noncrop_flat:
+                                                selected_noncrop_flat.append(c)
+                                                if len(selected_noncrop_flat) >= n_sample_each:
+                                                    break
+                                        if len(selected_noncrop_flat) >= n_sample_each:
+                                            break
+
+                                    # 容错兜底：若在特殊全耕地密集区拒绝抽样未满，回退到 1D 稀疏检索
+                                    if len(selected_noncrop_flat) < n_sample_each:
+                                        nc_flat = np.flatnonzero(flat_view == 0)
+                                        if len(nc_flat) > 0:
+                                            sel_nc_n = min(n_sample_each, len(nc_flat))
+                                            sel_nc = np.random.choice(nc_flat, size=sel_nc_n, replace=False)
+                                            selected_noncrop_flat = list(sel_nc)
+
+                                    if selected_noncrop_flat:
+                                        nc_r, nc_c = np.unravel_index(np.array(selected_noncrop_flat), (H, W_dim))
+                                        noncrop_xs, noncrop_ys = rasterio.transform.xy(src_win_transform, nc_r, nc_c)
+                                    else:
+                                        noncrop_xs, noncrop_ys = [], []
+
                                     all_xs = list(crop_xs) + list(noncrop_xs)
                                     all_ys = list(crop_ys) + list(noncrop_ys)
                                     map_labels = [1] * len(crop_xs) + [0] * len(noncrop_xs)
-                                    
+
                                     coords = list(zip(all_xs, all_ys))
                                     sampled_ref = [v[0] for v in ref_src.sample(coords, indexes=1)]
-                                    
+
                                     matched_ref = pd.DataFrame({
                                         "lon": all_xs,
                                         "lat": all_ys,
@@ -922,7 +949,7 @@ def main():
                                         "weight": 1.0
                                     })
                                     matched_ref = matched_ref[matched_ref["map_label"] != 255].copy()
-                                    
+
                                     # 将评估基准掩膜与边界严格绑定到实际相交有效区域
                                     mask = mask_inter
                                     bounds = (inter_left, inter_bottom, inter_right, inter_top)
@@ -937,6 +964,12 @@ def main():
                         except Exception as e:
                             pass
 
+                # 若未通过相交参考栅格局部切片生成 mask（例如基于外部地面点 CSV），在此处按需延迟读取整景
+                if mask is None:
+                    raw_mask = src.read(target_band)
+                    mask = np.where((raw_mask == 10) | (raw_mask == 1), np.uint8(1), np.where(raw_mask == 0, np.uint8(0), np.uint8(255)))
+                    del raw_mask
+
                 # 若仍无参考数据：如果用户明确放入了参考数据但空间不重叠，严正报错中止；只有参考库彻底为空时才允许仿真演示
                 if len(matched_ref) < 20:
                     if ref_files:
@@ -950,7 +983,7 @@ def main():
                         sys.exit(1)
                     else:
                         print(f"  -> 瓦片 [{tile_name}] 参考库为空，依据 Cochran 规程生成理论基准抽样样方...")
-                        _, matched_ref = simulate_benchmark_scene(rows=mask.shape[0], cols=mask.shape[1], seed=42)
+                        _, matched_ref = simulate_benchmark_scene(rows=min(mask.shape[0], 500), cols=min(mask.shape[1], 500), seed=42)
 
                 scene_list.append({
                     "scene_id": tile_name,
